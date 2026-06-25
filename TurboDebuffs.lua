@@ -758,6 +758,10 @@ end
 local function ScanUnitAuras(unit, auraScan)
     ResetScanState()
 
+    if not auraScan and ns.IsUnitAuraScanReliable and not ns.IsUnitAuraScanReliable(unit) then
+        return nil
+    end
+
     if not auraScan and ns.GetAuraScanForUnit then
         auraScan = ns.GetAuraScanForUnit(unit)
     end

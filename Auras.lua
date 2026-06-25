@@ -5,9 +5,13 @@ local addonName, ns = ...
 -- =============================================================================
 local UnitExists = UnitExists
 local UnitIsFriend = UnitIsFriend
+local UnitIsPlayer = UnitIsPlayer
+local UnitIsUnit = UnitIsUnit
+local UnitGUID = UnitGUID
+local UnitName = UnitName
 local GetTime = GetTime
 local GetSpellInfo = GetSpellInfo
-local pairs, ipairs = pairs, ipairs
+local pairs, ipairs, next = pairs, ipairs, next
 local tinsert, tremove, wipe, concat = table.insert, table.remove, wipe, table.concat
 local floor = math.floor
 local format = string.format
@@ -24,6 +28,11 @@ local GetNamePlates = WotLK.GetNamePlates
 local After = WotLK.After
 local ForEachAura = WotLK.ForEachAura
 local RegisterUnitBucket = WotLK.RegisterUnitBucket
+local GetCombatLogCurrentEventInfo = WotLK.GetCombatLogCurrentEventInfo
+
+local function IsNameplateUnit(unit)
+    return unit and strsub(unit, 1, 9) == "nameplate"
+end
 
 -- =============================================================================
 -- CREATE TEXTURE BORDER UTILITY (uses shared system from Nameplates.lua)
@@ -114,6 +123,10 @@ local IconCache = setmetatable({}, {
 
 -- Get cached icon - prefers aura data we already have
 local function GetCachedIcon(spellID, iconFromAura)
+    if not spellID then
+        return iconFromAura
+    end
+
     if iconFromAura then
         -- Cache from aura data (zero API calls)
         local cached = rawget(IconCache, spellID)
@@ -124,6 +137,61 @@ local function GetCachedIcon(spellID, iconFromAura)
     end
     -- Fallback: metatable triggers GetSpellInfo
     return IconCache[spellID]
+end
+
+-- WotLK/Awesome nameplate aura tokens can be ambiguous for duplicate NPC names.
+-- Avoid trusting raw UnitAura(nameplateN) when another visible NPC has the same
+-- name unless the unit is also target/mouseover/focus or the name is unique.
+local visibleNameCounts = {}
+local visibleNameCountsTime = -1
+local NAME_COUNT_CACHE_SECONDS = 0.05
+
+local function RefreshVisibleNameCounts()
+    wipe(visibleNameCounts)
+
+    local plates = GetNamePlates()
+    for i = 1, #plates do
+        local nameplate = plates[i]
+        local unit = nameplate and nameplate._unit
+        if unit and UnitExists(unit) and not UnitIsPlayer(unit) then
+            local name = UnitName(unit)
+            if name and name ~= "" then
+                visibleNameCounts[name] = (visibleNameCounts[name] or 0) + 1
+            end
+        end
+    end
+
+    visibleNameCountsTime = GetTime()
+end
+
+local function GetVisibleNameCount(name)
+    local now = GetTime()
+    if visibleNameCountsTime < 0 or now - visibleNameCountsTime > NAME_COUNT_CACHE_SECONDS then
+        RefreshVisibleNameCounts()
+    end
+
+    return visibleNameCounts[name] or 0
+end
+
+function ns.InvalidateAuraNameplateNameCounts()
+    visibleNameCountsTime = -1
+end
+
+function ns.IsUnitAuraScanReliable(unit)
+    if not unit or not UnitExists(unit) then
+        return false
+    end
+
+    if not IsNameplateUnit(unit) then
+        return true
+    end
+
+    if UnitIsUnit(unit, "target") or UnitIsUnit(unit, "mouseover") or UnitIsUnit(unit, "focus") then
+        return true
+    end
+
+    local name = UnitName(unit)
+    return name and name ~= "" and GetVisibleNameCount(name) <= 1
 end
 
 -- =============================================================================
@@ -313,6 +381,9 @@ end
 
 function ns.GetAuraScanForUnit(unit)
     if not activeAuraScans or not unit or not UnitExists(unit) then
+        return nil
+    end
+    if ns.IsUnitAuraScanReliable and not ns.IsUnitAuraScanReliable(unit) then
         return nil
     end
 
@@ -688,6 +759,14 @@ function ns.UpdateNameplateAuraColorOverride(myPlate, unit, auraScan)
     wipe(auraColorMatchAny)
     wipe(auraColorMatchOwn)
 
+    if not auraScan and ns.IsUnitAuraScanReliable and not ns.IsUnitAuraScanReliable(unit) then
+        if previousColor then
+            myPlate._auraColorOverride = nil
+            return true
+        end
+        return false
+    end
+
     if not auraScan and ns.GetAuraScanForUnit then
         auraScan = ns.GetAuraScanForUnit(unit)
     end
@@ -827,12 +906,12 @@ local currentIsPersonal = false  -- Set before calling ForEachAura
 
 local function PassesFilters(spellID, duration, canStealOrPurge, auraType, debuffType)
     -- 1. BLACKLIST: Always reject first (applies to all modes, all plates)
-    if rawget(ns.AuraBlacklist, spellID) then
+    if spellID and rawget(ns.AuraBlacklist, spellID) then
         return false
     end
 
     -- 2. WHITELIST: Apply inside each branch so buff filter modes stay distinct
-    local isWhitelisted = rawget(ns.AuraWhitelist, spellID)
+    local isWhitelisted = spellID and rawget(ns.AuraWhitelist, spellID)
 
     -- For buffs: treat Magic-type as dispellable (isStealable flag is unreliable on player targets)
     local isDispellable = canStealOrPurge or (auraType == "buff" and debuffType == "Magic")
@@ -964,6 +1043,264 @@ local function ProcessAuraCallback(name, rank, icon, count, debuffType, duration
     aura.timeLeft = (expires and expires > 0) and (expires - currentTime) or 0
 
     tinsert(currentCollector, aura)
+end
+
+local playerDebuffsByGUID = {}
+local learnedPlayerDebuffDurations = {}
+local cachedPlayerDebuffSeen = {}
+local playerGUID = nil
+local LOG_ONLY_PLAYER_DEBUFF_CACHE_SECONDS = 60
+
+local function GetPlayerGUID()
+    if not playerGUID then
+        playerGUID = UnitGUID("player")
+    end
+    return playerGUID
+end
+
+local function GetAuraCacheKey(spellID, name)
+    return spellID or name
+end
+
+local function GetCachedAuraIcon(spellID, icon)
+    if spellID then
+        return GetCachedIcon(spellID, icon)
+    end
+    return icon
+end
+
+local function ClearCachedPlayerDebuffs(guid)
+    local cache = guid and playerDebuffsByGUID[guid]
+    if cache then
+        wipe(cache)
+        playerDebuffsByGUID[guid] = nil
+    end
+end
+
+local function StoreCachedPlayerDebuff(guid, aura)
+    if not guid or not aura then return end
+
+    local key = GetAuraCacheKey(aura.spellID, aura.name)
+    if not key then return end
+
+    local cache = playerDebuffsByGUID[guid]
+    if not cache then
+        cache = {}
+        playerDebuffsByGUID[guid] = cache
+    end
+
+    local record = cache[key]
+    if not record then
+        record = {}
+        cache[key] = record
+    end
+
+    record.name = aura.name
+    record.icon = GetCachedAuraIcon(aura.spellID, aura.icon)
+    record.count = aura.count or 0
+    record.debuffType = aura.debuffType
+    record.duration = aura.duration or 0
+    record.expires = aura.expires or 0
+    record.canStealOrPurge = aura.canStealOrPurge
+    record.spellID = aura.spellID
+    record.source = "UNIT"
+    record.logExpires = nil
+
+    if aura.spellID and aura.duration and aura.duration > 0 then
+        learnedPlayerDebuffDurations[aura.spellID] = aura.duration
+    end
+end
+
+local function CachePlayerDebuffsFromCollector(guid, collector)
+    if not guid then return end
+
+    wipe(cachedPlayerDebuffSeen)
+
+    if collector then
+        for i = 1, #collector do
+            local aura = collector[i]
+            local key = GetAuraCacheKey(aura.spellID, aura.name)
+            if key then
+                cachedPlayerDebuffSeen[key] = true
+            end
+            StoreCachedPlayerDebuff(guid, aura)
+        end
+    end
+
+    local cache = playerDebuffsByGUID[guid]
+    if cache then
+        for key, record in pairs(cache) do
+            if record.source == "UNIT" and not cachedPlayerDebuffSeen[key] then
+                cache[key] = nil
+            end
+        end
+
+        if not next(cache) then
+            playerDebuffsByGUID[guid] = nil
+        end
+    end
+
+    wipe(cachedPlayerDebuffSeen)
+end
+
+local function PassesCachedPlayerDebuff(record)
+    if record.spellID and rawget(ns.AuraBlacklist, record.spellID) then
+        return false
+    end
+
+    if record.source == "LOG" and (not record.duration or record.duration == 0) then
+        return true
+    end
+
+    return PassesFilters(record.spellID, record.duration, record.canStealOrPurge, "debuff", record.debuffType)
+end
+
+local function CollectCachedPlayerDebuffs(guid)
+    local cache = guid and playerDebuffsByGUID[guid]
+    if not cache then return end
+
+    for key, record in pairs(cache) do
+        local expires = record.expires or 0
+        local logExpires = record.logExpires
+        if (expires > 0 and expires <= currentTime) or (logExpires and logExpires <= currentTime) then
+            cache[key] = nil
+        elseif PassesCachedPlayerDebuff(record) then
+            local aura = AcquireAuraData()
+            aura.name = record.name
+            aura.icon = record.icon
+            aura.count = record.count or 0
+            aura.debuffType = record.debuffType
+            aura.duration = record.duration or 0
+            aura.expires = expires
+            aura.canStealOrPurge = record.canStealOrPurge
+            aura.spellID = record.spellID
+            aura.isDebuff = true
+            aura.timeLeft = (expires > 0) and (expires - currentTime) or 0
+            tinsert(currentCollector, aura)
+        end
+    end
+
+    if not next(cache) then
+        playerDebuffsByGUID[guid] = nil
+    end
+end
+
+local function RefreshAuraPlateByGUID(guid)
+    if not guid then return end
+
+    local plates = GetNamePlates()
+    if not plates or #plates == 0 then return end
+
+    if ns.BeginAuraScanBatch and ns.EndAuraScanBatch then
+        ns.BeginAuraScanBatch()
+    end
+
+    local ok, err = pcall(function()
+        for i = 1, #plates do
+            local nameplate = plates[i]
+            local unit = nameplate and nameplate._unit
+            local myPlate = nameplate and nameplate.myPlate
+            local plateGUID = myPlate and myPlate.cachedGUID or (unit and UnitGUID(unit))
+
+            if plateGUID == guid and unit and UnitExists(unit) then
+                if myPlate and ns.UpdatePlateAuraConsumers then
+                    ns.UpdatePlateAuraConsumers(myPlate, unit)
+                elseif nameplate._isLite and ns.UpdateLiteTurboDebuff then
+                    ns:UpdateLiteTurboDebuff(nameplate, unit)
+                end
+            end
+        end
+    end)
+
+    if ns.BeginAuraScanBatch and ns.EndAuraScanBatch then
+        ns.EndAuraScanBatch()
+    end
+
+    if not ok then
+        error(err)
+    end
+end
+
+local PLAYER_DEBUFF_APPLIED_EVENTS = {
+    SPELL_AURA_APPLIED = true,
+    SPELL_AURA_REFRESH = true,
+    SPELL_AURA_APPLIED_DOSE = true,
+    SPELL_AURA_REMOVED_DOSE = true,
+}
+
+local PLAYER_DEBUFF_REMOVED_EVENTS = {
+    SPELL_AURA_REMOVED = true,
+}
+
+local function UpdatePlayerDebuffCacheFromCombatLog(...)
+    local _, subevent, _, sourceGUID, _, _, _, destGUID, _, _, _, spellID, spellName, _, auraType, amount =
+        GetCombatLogCurrentEventInfo(...)
+
+    if not subevent or not destGUID then return end
+
+    if subevent == "UNIT_DIED" or subevent == "UNIT_DESTROYED" then
+        ClearCachedPlayerDebuffs(destGUID)
+        RefreshAuraPlateByGUID(destGUID)
+        return
+    end
+
+    if auraType ~= "DEBUFF" or sourceGUID ~= GetPlayerGUID() then
+        return
+    end
+
+    if PLAYER_DEBUFF_REMOVED_EVENTS[subevent] then
+        local cache = playerDebuffsByGUID[destGUID]
+        local key = cache and GetAuraCacheKey(spellID, spellName)
+        if key then
+            cache[key] = nil
+            if not next(cache) then
+                playerDebuffsByGUID[destGUID] = nil
+            end
+        end
+        RefreshAuraPlateByGUID(destGUID)
+        return
+    end
+
+    if not PLAYER_DEBUFF_APPLIED_EVENTS[subevent] then
+        return
+    end
+
+    local key = GetAuraCacheKey(spellID, spellName)
+    if not key then return end
+
+    local cache = playerDebuffsByGUID[destGUID]
+    if not cache then
+        cache = {}
+        playerDebuffsByGUID[destGUID] = cache
+    end
+
+    local record = cache[key]
+    if not record then
+        record = {}
+        cache[key] = record
+    end
+
+    local now = GetTime()
+    local learnedDuration = spellID and learnedPlayerDebuffDurations[spellID]
+    local name, _, icon = spellID and GetSpellInfo(spellID)
+    record.name = spellName or name
+    record.icon = GetCachedAuraIcon(spellID, icon)
+    record.count = amount or record.count or 0
+    if learnedDuration and learnedDuration > 0 then
+        record.duration = learnedDuration
+        record.expires = now + learnedDuration
+        record.logExpires = nil
+    else
+        record.duration = 0
+        record.expires = 0
+        record.logExpires = now + LOG_ONLY_PLAYER_DEBUFF_CACHE_SECONDS
+    end
+    record.canStealOrPurge = false
+    record.spellID = spellID
+    record.source = "LOG"
+    record.appliedAt = now
+
+    RefreshAuraPlateByGUID(destGUID)
 end
 
 -- =============================================================================
@@ -1195,6 +1532,7 @@ function ns:UpdateAuras(myPlate, unit, auraScan)
     if not myPlate.debuffContainer then return end
 
     local isPersonal = myPlate.isPlayer
+    local unitAuraReliable = isPersonal or not ns.IsUnitAuraScanReliable or ns.IsUnitAuraScanReliable(unit)
 
     -- === PERSONAL NAMEPLATE BRANCH ===
     if isPersonal then
@@ -1295,13 +1633,21 @@ function ns:UpdateAuras(myPlate, unit, auraScan)
         if ns.c_showDebuffs then
             currentAuraType = "debuff"
             currentCollector = debuffCollector
-            if not auraScan and ns.GetAuraScanForUnit then
-                auraScan = ns.GetAuraScanForUnit(unit)
-            end
-            if auraScan then
-                ForEachScannedAura(auraScan.harmfulPlayer, ProcessAuraCallback)
+            local playerDebuffCacheSource = nil
+            if unitAuraReliable then
+                if not auraScan and ns.GetAuraScanForUnit then
+                    auraScan = ns.GetAuraScanForUnit(unit)
+                end
+                if auraScan then
+                    playerDebuffCacheSource = auraScan.harmfulPlayer
+                    ForEachScannedAura(auraScan.harmfulPlayer, ProcessAuraCallback)
+                else
+                    ForEachAura(unit, "HARMFUL|PLAYER", 40, ProcessAuraCallback)
+                    playerDebuffCacheSource = debuffCollector
+                end
+                CachePlayerDebuffsFromCollector(UnitGUID(unit), playerDebuffCacheSource)
             else
-                ForEachAura(unit, "HARMFUL|PLAYER", 40, ProcessAuraCallback)
+                CollectCachedPlayerDebuffs(UnitGUID(unit))
             end
             myPlate.debuffContainer:Show()
         else
@@ -1313,13 +1659,15 @@ function ns:UpdateAuras(myPlate, unit, auraScan)
         if ns.c_showBuffs then
             currentAuraType = "buff"
             currentCollector = buffCollector
-            if not auraScan and ns.GetAuraScanForUnit then
-                auraScan = ns.GetAuraScanForUnit(unit)
-            end
-            if auraScan then
-                ForEachScannedAura(auraScan.helpful, ProcessAuraCallback)
-            else
-                ForEachAura(unit, "HELPFUL", 40, ProcessAuraCallback)
+            if unitAuraReliable then
+                if not auraScan and ns.GetAuraScanForUnit then
+                    auraScan = ns.GetAuraScanForUnit(unit)
+                end
+                if auraScan then
+                    ForEachScannedAura(auraScan.helpful, ProcessAuraCallback)
+                else
+                    ForEachAura(unit, "HELPFUL", 40, ProcessAuraCallback)
+                end
             end
             myPlate.buffContainer:Show()
         else
@@ -1395,6 +1743,57 @@ function ns.UpdatePlateAuraConsumers(myPlate, unit)
         if ns.UpdateTurboDebuff then
             ns:UpdateTurboDebuff(myPlate, unit)
         end
+    end
+end
+
+function ns.RefreshSameNameAuraPlates(unit)
+    if not unit or not UnitExists(unit) then return end
+
+    local name = UnitName(unit)
+    if not name or name == "" then return end
+
+    ns.InvalidateAuraNameplateNameCounts()
+
+    local plates = GetNamePlates()
+    local sameNameCount = 0
+    for i = 1, #plates do
+        local nameplate = plates[i]
+        local plateUnit = nameplate and nameplate._unit
+        if plateUnit and UnitExists(plateUnit) and UnitName(plateUnit) == name then
+            sameNameCount = sameNameCount + 1
+            if sameNameCount > 1 then
+                break
+            end
+        end
+    end
+    if sameNameCount <= 1 then
+        return
+    end
+
+    if ns.BeginAuraScanBatch and ns.EndAuraScanBatch then
+        ns.BeginAuraScanBatch()
+    end
+
+    local ok, err = pcall(function()
+        for i = 1, #plates do
+            local nameplate = plates[i]
+            local plateUnit = nameplate and nameplate._unit
+            if plateUnit and UnitExists(plateUnit) and UnitName(plateUnit) == name then
+                if nameplate.myPlate then
+                    ns.UpdatePlateAuraConsumers(nameplate.myPlate, plateUnit)
+                elseif nameplate._isLite and ns.UpdateLiteTurboDebuff then
+                    ns:UpdateLiteTurboDebuff(nameplate, plateUnit)
+                end
+            end
+        end
+    end)
+
+    if ns.BeginAuraScanBatch and ns.EndAuraScanBatch then
+        ns.EndAuraScanBatch()
+    end
+
+    if not ok then
+        error(err)
     end
 end
 
@@ -1561,11 +1960,6 @@ end
 -- =============================================================================
 local pendingPlayerAura = false  -- Flag for player aura update (personal bar)
 
--- Fast nameplate check (uses cached strsub)
-local function IsNameplateUnit(unit)
-    return unit and strsub(unit, 1, 9) == "nameplate"
-end
-
 local function ProcessAuraBatch(units)
     pendingPlayerAura = false  -- Reset player flag
 
@@ -1633,6 +2027,19 @@ local function SetupAuraEvents()
         ns.EndAuraScanBatch()
         if not ok then
             error(err)
+        end
+    end)
+
+    eventFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+    eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+    eventFrame:HookScript("OnEvent", function(_, event, ...)
+        if event == "COMBAT_LOG_EVENT_UNFILTERED" then
+            UpdatePlayerDebuffCacheFromCombatLog(...)
+        elseif event == "PLAYER_ENTERING_WORLD" then
+            playerGUID = UnitGUID("player")
+            wipe(playerDebuffsByGUID)
+            wipe(learnedPlayerDebuffDurations)
+            ns.InvalidateAuraNameplateNameCounts()
         end
     end)
 end

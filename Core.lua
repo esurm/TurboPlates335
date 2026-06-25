@@ -541,6 +541,10 @@ local function TrackNameplate(unit, nameplate)
     ns.unitToNameplate[unit] = nameplate
     ns.unitToNameplateGUID[unit] = guid
 
+    if ns.InvalidateAuraNameplateNameCounts then
+        ns.InvalidateAuraNameplateNameCounts()
+    end
+
     ScheduleGuardedNameplateCleanup()
 end
 
@@ -1135,6 +1139,9 @@ local function OnNamePlateAdded(_, unit, nameplate)
         if ns.UpdateNameplateAlphaForPlate then
             ns.UpdateNameplateAlphaForPlate(nameplate, "refresh")
         end
+        if ns.RefreshSameNameAuraPlates then
+            ns.RefreshSameNameAuraPlates(unit)
+        end
         return
     end
 
@@ -1183,6 +1190,9 @@ local function OnNamePlateAdded(_, unit, nameplate)
         if ns.FullPlateUpdate then
             ns:FullPlateUpdate(nameplate.myPlate, unit)
         end
+        if ns.RefreshSameNameAuraPlates then
+            ns.RefreshSameNameAuraPlates(unit)
+        end
 
         if ns.UpdateNameplateAlphaForPlate then
             ns.UpdateNameplateAlphaForPlate(nameplate, "refresh")
@@ -1202,6 +1212,10 @@ end
 
 -- Hide frames when nameplate removed (frames are reused)
 OnNamePlateRemoved = function(_, unit, nameplate)
+    if ns.InvalidateAuraNameplateNameCounts then
+        ns.InvalidateAuraNameplateNameCounts()
+    end
+
     local trackedNameplate = unit and ns.unitToNameplate[unit]
     if not nameplate and unit then
         nameplate = trackedNameplate
