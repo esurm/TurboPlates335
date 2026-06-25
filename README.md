@@ -51,7 +51,7 @@ Settings are organized into tabs:
 Runtime requirement:
 - AwesomeWotlk, for `C_NamePlate` APIs and `nameplateN` unit tokens
 
-TurboPlates includes the small WotLK runtime shims it needs for timers, pixel helpers, aura iteration, combat-log payloads, and group helpers. It does not require `!!!ClassicAPI` as a separate addon.
+TurboPlates includes the small WotLK runtime shims it needs for timers, pixel helpers, aura iteration, combat-log payloads, and group helpers. It does not require `ClassicAPI` as a separate addon.
 
 Includes the following libraries:
 - LibStub
