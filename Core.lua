@@ -489,7 +489,7 @@ local function SafeDisableBlizzPlate(unit, nameplate)
     end
 end
 
-local OnNamePlateRemoved
+local OnNamePlateAdded, OnNamePlateRemoved
 local RunGuardedNameplateCleanup
 local guardedNameplateCleanupScheduled = false
 local GUARDED_NAMEPLATE_CLEANUP_INTERVAL = 0.5
@@ -523,8 +523,67 @@ local function ScheduleGuardedNameplateCleanup()
     After(GUARDED_NAMEPLATE_CLEANUP_INTERVAL, RunGuardedNameplateCleanup)
 end
 
+local function IsNativeNameplateVisible(nameplate)
+    if not nameplate then return false end
+    if nameplate.IsShown and not nameplate:IsShown() then return false end
+    return true
+end
+
+local function GetVisibleUnitForNameplate(nameplate)
+    local unit = nameplate and (nameplate._unit or nameplate._turboTrackedUnit)
+    if not unit or not UnitExists(unit) then return nil end
+
+    local currentPlate = GetNamePlateForUnit(unit)
+    if currentPlate and currentPlate ~= nameplate then
+        return nil
+    end
+
+    return unit
+end
+
+local function HideTurboOverlayFrames(nameplate)
+    if not nameplate then return end
+
+    if nameplate.liteContainer then
+        if ns.HideLiteNameHighlight then
+            ns.HideLiteNameHighlight(nameplate.liteContainer)
+        end
+        nameplate.liteContainer:Hide()
+    end
+
+    if nameplate.myPlate then
+        nameplate.myPlate:Hide()
+    end
+end
+
+local function InstallNativeNameplateLifecycleHooks(nameplate)
+    if not nameplate or nameplate._turboLifecycleHooksInstalled or not nameplate.HookScript then return end
+
+    nameplate:HookScript("OnHide", function(frame)
+        local unit = frame._turboTrackedUnit or frame._unit
+        if unit and OnNamePlateRemoved then
+            OnNamePlateRemoved(nil, unit, frame)
+        else
+            HideTurboOverlayFrames(frame)
+        end
+    end)
+
+    nameplate:HookScript("OnShow", function(frame)
+        if not OnNamePlateAdded then return end
+
+        local unit = GetVisibleUnitForNameplate(frame)
+        if unit then
+            OnNamePlateAdded(nil, unit, frame)
+        end
+    end)
+
+    nameplate._turboLifecycleHooksInstalled = true
+end
+
 local function TrackNameplate(unit, nameplate)
     if not unit or not nameplate then return end
+
+    InstallNativeNameplateLifecycleHooks(nameplate)
 
     local oldUnit = nameplate._turboTrackedUnit
     if oldUnit and oldUnit ~= unit then
@@ -563,7 +622,7 @@ RunGuardedNameplateCleanup = function()
             local currentUnit = nameplate._unit
 
             if currentUnit == unit then
-                if not UnitExists(unit) then
+                if not UnitExists(unit) or not IsNativeNameplateVisible(nameplate) then
                     OnNamePlateRemoved(nil, unit, nameplate)
                 else
                     local currentGUID = UnitGUID(unit)
@@ -861,11 +920,16 @@ end
 
 -- Event-driven nameplate handling via AwesomeWotlk
 -- Uses SafeDisableBlizzPlate to hide elements during combat without SetAttribute
-local function OnNamePlateAdded(_, unit, nameplate)
+OnNamePlateAdded = function(_, unit, nameplate)
     if not nameplate and unit then
         nameplate = GetNamePlateForUnit(unit)
     end
     if not unit or not nameplate then return end
+
+    if not IsNativeNameplateVisible(nameplate) then
+        OnNamePlateRemoved(nil, unit, nameplate)
+        return
+    end
 
     TrackNameplate(unit, nameplate)
 
@@ -1136,6 +1200,9 @@ local function OnNamePlateAdded(_, unit, nameplate)
 
         container:Show()
         nameplate._isLite = true
+        if ns.InstallNativeHealthMirrorForPlate then
+            ns.InstallNativeHealthMirrorForPlate(nameplate)
+        end
         if ns.UpdateNameplateAlphaForPlate then
             ns.UpdateNameplateAlphaForPlate(nameplate, "refresh")
         end
@@ -1380,11 +1447,11 @@ end
 -- Note: Lite plate cache is now handled by Nameplates.lua:UpdateDBCache (ns.c_*)
 
 -- Update lite health bar (shared between OnNamePlateAdded and UNIT_HEALTH updates)
-function ns:UpdateLiteHealthBar(container, unit)
+function ns:UpdateLiteHealthBar(container, unit, health, maxHealth)
     if not container or not container.liteHealthBar then return end
 
-    local health = UnitHealth(unit)
-    local maxHealth = UnitHealthMax(unit)
+    health = health or UnitHealth(unit)
+    maxHealth = maxHealth or UnitHealthMax(unit)
 
     if health < maxHealth and maxHealth > 0 then
         local liteHP = container.liteHealthBar
@@ -1415,7 +1482,7 @@ function ns:UpdateAllPlates()
 
     for nameplate in EnumerateActiveNamePlates() do
         local unit = nameplate._unit
-        if unit and UnitExists(unit) then
+        if unit and UnitExists(unit) and IsNativeNameplateVisible(nameplate) then
             local isFriendly = UnitIsFriend("player", unit)
 
             -- Never use lite plate for player's own personal nameplate
@@ -1676,6 +1743,9 @@ function ns:UpdateAllPlates()
                 end
 
                 container:Show()
+                if ns.InstallNativeHealthMirrorForPlate then
+                    ns.InstallNativeHealthMirrorForPlate(nameplate)
+                end
             else
                 if nameplate.liteContainer then
                     ns.HideLiteNameHighlight(nameplate.liteContainer)

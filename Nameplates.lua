@@ -3640,21 +3640,22 @@ end
 
 -- Direct health update (called frequently for regular nameplates)
 -- Personal plate health is handled separately by ProcessPersonalUpdates
-local function UpdateHealth(unit)
-    local myPlate = ns.unitToPlate[unit]
-    if not myPlate or myPlate.isNameOnly or not myPlate.hp then return end
+local function ApplyHealthValue(myPlate, current, max)
+    if not myPlate or myPlate.isNameOnly or not myPlate.hp then return false end
+    if myPlate.isPlayer then return false end
 
-    -- Skip personal plates - they use ProcessPersonalUpdates with ns.c_personalHealthFormat
-    if myPlate.isPlayer then return end
+    current = tonumber(current) or 0
+    max = tonumber(max) or 0
+    if max <= 0 then return false end
+    if current < 0 then
+        current = 0
+    elseif current > max then
+        current = max
+    end
 
     local hp = myPlate.hp
-    local current = UnitHealth(unit)
-    local max = UnitHealthMax(unit)
     hp:SetMinMaxValues(0, max)
     hp:SetValue(current)
-
-    -- Update absorb bar (health changes affect absorb display position)
-    UpdateAbsorb(unit, myPlate)
 
     -- Update health value text (only show/hide when state changes)
     if myPlate.healthText and ns.c_healthValueFormat ~= "none" then
@@ -3697,6 +3698,102 @@ local function UpdateHealth(unit)
                 myPlate.execIndicator:Hide()
             end
         end
+    end
+
+    return true
+end
+
+local function IsPlateGUIDCurrent(plate, unit)
+    if not plate or not unit then return false end
+    if not UnitExists(unit) then return false end
+
+    local currentGUID = UnitGUID(unit)
+    return not plate.cachedGUID or not currentGUID or plate.cachedGUID == currentGUID
+end
+
+local function GetNativeHealthBar(myPlate)
+    local parentPlate = myPlate and myPlate.parentPlate
+    local nativeBar = parentPlate and parentPlate._turboNativeHealthBar
+    if nativeBar and nativeBar.GetValue and nativeBar.GetMinMaxValues then
+        return nativeBar
+    end
+end
+
+local function UpdateHealthFromNativeBar(nativeBar, value)
+    if not nativeBar or not nativeBar.GetParent or not nativeBar.GetMinMaxValues then return end
+
+    local nameplate = nativeBar:GetParent()
+    if not nameplate then return end
+
+    local unit = nameplate._unit
+    if not unit or not UnitExists(unit) then return end
+
+    local _, max = nativeBar:GetMinMaxValues()
+    if not max or max <= 0 then return end
+
+    if value == nil and nativeBar.GetValue then
+        value = nativeBar:GetValue()
+    end
+
+    local updated = false
+    local myPlate = nameplate.myPlate
+    if myPlate and myPlate:IsShown() and IsPlateGUIDCurrent(myPlate, unit) then
+        updated = ApplyHealthValue(myPlate, value, max) or updated
+    end
+
+    local container = nameplate.liteContainer
+    if nameplate._isLite and container and container:IsShown() and IsPlateGUIDCurrent(container, unit) and ns.UpdateLiteHealthBar then
+        ns:UpdateLiteHealthBar(container, unit, value, max)
+        updated = true
+    end
+
+    return updated
+end
+
+local function InstallNativeHealthMirrorForNameplate(nameplate)
+    local nativeBar = nameplate and nameplate._turboNativeHealthBar
+    if not nativeBar or not nativeBar.HookScript or not nativeBar.GetValue then return end
+
+    if not nativeBar._turboHealthMirrorHooked then
+        nativeBar:HookScript("OnValueChanged", UpdateHealthFromNativeBar)
+        nativeBar._turboHealthMirrorHooked = true
+    end
+
+    UpdateHealthFromNativeBar(nativeBar, nativeBar:GetValue())
+end
+
+local function InstallNativeHealthMirror(myPlate)
+    InstallNativeHealthMirrorForNameplate(myPlate and myPlate.parentPlate)
+end
+
+function ns.InstallNativeHealthMirrorForPlate(nameplate)
+    InstallNativeHealthMirrorForNameplate(nameplate)
+end
+
+local function UpdateHealth(unit)
+    local myPlate = ns.unitToPlate[unit]
+    if not myPlate or myPlate.isNameOnly or not myPlate.hp then return end
+
+    -- Skip personal plates - they use ProcessPersonalUpdates with ns.c_personalHealthFormat
+    if myPlate.isPlayer then return end
+
+    local nativeBar = GetNativeHealthBar(myPlate)
+    if nativeBar then
+        if not nativeBar._turboHealthMirrorHooked then
+            InstallNativeHealthMirror(myPlate)
+        end
+        if UpdateHealthFromNativeBar(nativeBar, nativeBar:GetValue()) then
+            -- Absorb still relies on the unit API, but it must not overwrite visible HP.
+            UpdateAbsorb(unit, myPlate)
+            return
+        end
+    end
+
+    local current = UnitHealth(unit)
+    local max = UnitHealthMax(unit)
+    if ApplyHealthValue(myPlate, current, max) then
+        -- Update absorb bar (health changes affect absorb display position)
+        UpdateAbsorb(unit, myPlate)
     end
 end
 
@@ -5899,6 +5996,7 @@ function ns:FullPlateUpdate(myPlate, unit)
 
     -- Health & Color
     UpdateHealth(unit)
+    InstallNativeHealthMirror(myPlate)
     if ns.UpdateNameplateAuraColorOverride then
         ns.UpdateNameplateAuraColorOverride(myPlate, unit)
     end
