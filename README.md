@@ -49,7 +49,7 @@ Settings are organized into tabs:
 ## Dependencies
 
 Runtime requirement:
-- AwesomeWotlk, for `C_NamePlate` APIs and `nameplateN` unit tokens
+- AwesomeWotlk at https://github.com/esurm/AwesomeWoTLK, for `C_NamePlate` APIs and `nameplateN` unit tokens
 
 TurboPlates includes the small WotLK runtime shims it needs for timers, pixel helpers, aura iteration, combat-log payloads, and group helpers. It does not require `ClassicAPI` as a separate addon.
 
