@@ -936,6 +936,11 @@ end
 local function UpdateTurboDebuff(myPlate, unit, auraScan)
     if not myPlate or not unit then return end
 
+    if myPlate.cachedGUID and myPlate.cachedGUID ~= UnitGUID(unit) then
+        ns:HideTurboDebuff(myPlate)
+        return
+    end
+
     local cfg = ns.c_turboDebuffs or {}
     if not cfg.enabled then
         if myPlate.turboDebuff then myPlate.turboDebuff:Hide() end
@@ -1083,6 +1088,11 @@ local function UpdateLiteTurboDebuff(nameplate, unit, auraScan)
 
     local container = nameplate.liteContainer
     if not container then return end
+
+    if container.cachedGUID and container.cachedGUID ~= UnitGUID(unit) then
+        ns:HideLiteTurboDebuff(nameplate)
+        return
+    end
 
     -- Create frame if needed (parented to liteContainer)
     if not nameplate.liteTurboDebuff then

@@ -34,6 +34,31 @@ local function IsNameplateUnit(unit)
     return unit and strsub(unit, 1, 9) == "nameplate"
 end
 
+local function IsVisibleNameplateUnit(nameplate, unit)
+    if not nameplate or not unit or not UnitExists(unit) then return false end
+    if nameplate.IsShown and not nameplate:IsShown() then return false end
+
+    local currentPlate = GetNamePlateForUnit(unit)
+    if currentPlate and currentPlate ~= nameplate then return false end
+
+    local currentGUID = UnitGUID(unit)
+    if not currentGUID then return false end
+
+    local container = nameplate.liteContainer
+    if nameplate._isLite and container then
+        if container.IsShown and not container:IsShown() then return false end
+        return container.cachedGUID == currentGUID
+    end
+
+    local myPlate = nameplate.myPlate
+    if myPlate then
+        if myPlate.IsShown and not myPlate:IsShown() then return false end
+        return myPlate.cachedGUID == currentGUID
+    end
+
+    return false
+end
+
 -- =============================================================================
 -- CREATE TEXTURE BORDER UTILITY (uses shared system from Nameplates.lua)
 -- =============================================================================
@@ -566,10 +591,15 @@ function AuraPool:Release(icon)
     icon:Hide()
     icon:ClearAllPoints()
     icon:SetScript("OnUpdate", nil)
+    icon.duration:SetText("")
+    icon.duration:Hide()
+    icon.count:SetText("")
+    icon.count:Hide()
     icon.spellID = nil
     icon.expires = nil
     icon.elapsed = nil
     icon._hasOnUpdate = nil
+    icon._lastCount = nil
     tinsert(self.inactive, icon)
 end
 
@@ -648,7 +678,8 @@ end
 -- DURATION TEXT UPDATE (Uses Time Cache)
 -- =============================================================================
 local function UpdateDurationText(icon)
-    local timeLeft = icon.expires - GetTime()
+    local expires = icon.expires or 0
+    local timeLeft = expires - GetTime()
 
     if timeLeft <= 0 then
         icon.duration:SetText("")
@@ -701,10 +732,33 @@ local function AuraTimerOnUpdate(icon, elapsed)
         -- Aura expired - will be cleaned up on next UNIT_AURA
         icon.duration:SetText("")
         icon:SetScript("OnUpdate", nil)
+        icon._hasOnUpdate = nil
         return
     end
 
     UpdateDurationText(icon)
+end
+
+local function RefreshAuraTimerState(icon, aura)
+    local expires = aura and aura.expires or 0
+    icon.expires = expires
+    icon.elapsed = 0
+
+    if expires and expires > GetTime() then
+        if not icon._hasOnUpdate then
+            icon:SetScript("OnUpdate", AuraTimerOnUpdate)
+            icon._hasOnUpdate = true
+        end
+        UpdateDurationText(icon)
+        icon.duration:Show()
+    else
+        if icon._hasOnUpdate then
+            icon:SetScript("OnUpdate", nil)
+            icon._hasOnUpdate = nil
+        end
+        icon.duration:SetText("")
+        icon.duration:Hide()
+    end
 end
 
 -- =============================================================================
@@ -1111,6 +1165,19 @@ local function StoreCachedPlayerDebuff(guid, aura)
     end
 end
 
+local function RefreshCachedPlayerDebuffDuration(record, spellID)
+    if not record or not spellID then return end
+    if record.duration and record.duration > 0 then return end
+    if not record.appliedAt then return end
+
+    local learnedDuration = learnedPlayerDebuffDurations[spellID]
+    if not learnedDuration or learnedDuration <= 0 then return end
+
+    record.duration = learnedDuration
+    record.expires = record.appliedAt + learnedDuration
+    record.logExpires = nil
+end
+
 local function CachePlayerDebuffsFromCollector(guid, collector)
     if not guid then return end
 
@@ -1160,6 +1227,7 @@ local function CollectCachedPlayerDebuffs(guid)
     if not cache then return end
 
     for key, record in pairs(cache) do
+        RefreshCachedPlayerDebuffDuration(record, record.spellID)
         local expires = record.expires or 0
         local logExpires = record.logExpires
         if (expires > 0 and expires <= currentTime) or (logExpires and logExpires <= currentTime) then
@@ -1199,13 +1267,14 @@ local function RefreshAuraPlateByGUID(guid)
         for i = 1, #plates do
             local nameplate = plates[i]
             local unit = nameplate and nameplate._unit
-            local myPlate = nameplate and nameplate.myPlate
-            local plateGUID = myPlate and myPlate.cachedGUID or (unit and UnitGUID(unit))
-
-            if plateGUID == guid and unit and UnitExists(unit) then
+            if IsVisibleNameplateUnit(nameplate, unit) then
+                local myPlate = nameplate.myPlate
+                local container = nameplate.liteContainer
                 if myPlate and ns.UpdatePlateAuraConsumers then
-                    ns.UpdatePlateAuraConsumers(myPlate, unit)
-                elseif nameplate._isLite and ns.UpdateLiteTurboDebuff then
+                    if myPlate.cachedGUID == guid then
+                        ns.UpdatePlateAuraConsumers(myPlate, unit)
+                    end
+                elseif nameplate._isLite and container and container.cachedGUID == guid and ns.UpdateLiteTurboDebuff then
                     ns:UpdateLiteTurboDebuff(nameplate, unit)
                 end
             end
@@ -1455,26 +1524,22 @@ local function ApplyAuraIcon(icon, aura, iconWidth, iconHeight, fontSize, stackF
         icon.count:Hide()
     end
 
-    icon.expires = aura.expires
-    icon.elapsed = 0
-
-    if aura.expires > 0 then
-        if not icon._hasOnUpdate then
-            icon:SetScript("OnUpdate", AuraTimerOnUpdate)
-            icon._hasOnUpdate = true
-        end
-        UpdateDurationText(icon)
-        icon.duration:Show()
-    else
-        if icon._hasOnUpdate then
-            icon:SetScript("OnUpdate", nil)
-            icon._hasOnUpdate = nil
-        end
-        icon.duration:SetText("")
-        icon.duration:Hide()
-    end
+    RefreshAuraTimerState(icon, aura)
 
     icon:Show()
+end
+
+local function RefreshAuraTimerStates(container, auras, count)
+    local icons = container and container.icons
+    if not icons then return end
+
+    for i = 1, count do
+        local icon = icons[i]
+        local aura = auras[i]
+        if icon and aura then
+            RefreshAuraTimerState(icon, aura)
+        end
+    end
 end
 
 local function ReleaseExtraIcons(icons, firstIndex)
@@ -1495,6 +1560,7 @@ local function DisplayAuras(container, auras, maxCount, iconWidth, iconHeight, s
 
     local signature = BuildAuraSignature(auras, count, iconWidth, iconHeight, spacing, growDir, fontSize, stackFontSize, durationAnchor, stackAnchor, isPersonal)
     if container._lastAuraSignature == signature then
+        RefreshAuraTimerStates(container, auras, count)
         return
     end
     container._lastAuraSignature = signature
@@ -1521,6 +1587,11 @@ end
 function ns:UpdateAuras(myPlate, unit, auraScan)
     -- Early exit: no unit or containers
     if not unit or not UnitExists(unit) then return end
+
+    if myPlate and not myPlate.isPlayer and myPlate.cachedGUID and myPlate.cachedGUID ~= UnitGUID(unit) then
+        ns:CleanupPlateAuras(myPlate)
+        return
+    end
 
     if not myPlate.isPlayer then
         local colorChanged = ns.UpdateNameplateAuraColorOverride(myPlate, unit, auraScan)
@@ -1759,7 +1830,7 @@ function ns.RefreshSameNameAuraPlates(unit)
     for i = 1, #plates do
         local nameplate = plates[i]
         local plateUnit = nameplate and nameplate._unit
-        if plateUnit and UnitExists(plateUnit) and UnitName(plateUnit) == name then
+        if IsVisibleNameplateUnit(nameplate, plateUnit) and UnitName(plateUnit) == name then
             sameNameCount = sameNameCount + 1
             if sameNameCount > 1 then
                 break
@@ -1778,7 +1849,7 @@ function ns.RefreshSameNameAuraPlates(unit)
         for i = 1, #plates do
             local nameplate = plates[i]
             local plateUnit = nameplate and nameplate._unit
-            if plateUnit and UnitExists(plateUnit) and UnitName(plateUnit) == name then
+            if IsVisibleNameplateUnit(nameplate, plateUnit) and UnitName(plateUnit) == name then
                 if nameplate.myPlate then
                     ns.UpdatePlateAuraConsumers(nameplate.myPlate, plateUnit)
                 elseif nameplate._isLite and ns.UpdateLiteTurboDebuff then
@@ -1972,7 +2043,7 @@ local function ProcessAuraBatch(units)
     for unit in pairs(units) do
         if IsNameplateUnit(unit) then
             local nameplate = GetNamePlateForUnit(unit)
-            if nameplate then
+            if IsVisibleNameplateUnit(nameplate, unit) then
                 -- Update regular auras (full plates only)
                 if nameplate.myPlate then
                     ns:UpdateAuras(nameplate.myPlate, unit)

@@ -277,7 +277,7 @@ local function ProcessNPCTitleQueue()
             npcTitleQueue[npcID] = nil
             npcTitleQueueGUID[npcID] = nil
 
-            if unit and guid and not cache[npcID] and UnitExists(unit) and UnitGUID(unit) == guid and (not UnitIsPlayer(unit)) and (not UnitPlayerControlled(unit)) then
+            if unit and guid and not cache[npcID] and UnitExists(unit) and UnitGUID(unit) == guid and GetNPCIDForUnit(unit) == npcID and (not UnitIsPlayer(unit)) and (not UnitPlayerControlled(unit)) then
                 local title = ScanNPCTitle(unit)
                 if title and title ~= "" then
                     cache[npcID] = title
@@ -517,6 +517,16 @@ local function ClearUnitPlateLookup(unit, nameplate)
     end
 end
 
+local function ClearNameplateUnitCaches(nameplate)
+    if not nameplate then return end
+
+    nameplate._cachedName = nil
+    nameplate._cachedIsPlayer = nil
+    nameplate._cachedClass = nil
+    nameplate._cachedGuild = nil
+    nameplate._cachedNPCID = nil
+end
+
 local function ScheduleGuardedNameplateCleanup()
     if guardedNameplateCleanupScheduled then return end
     guardedNameplateCleanupScheduled = true
@@ -532,6 +542,7 @@ end
 local function GetVisibleUnitForNameplate(nameplate)
     local unit = nameplate and (nameplate._unit or nameplate._turboTrackedUnit)
     if not unit or not UnitExists(unit) then return nil end
+    if not UnitGUID(unit) then return nil end
 
     local currentPlate = GetNamePlateForUnit(unit)
     if currentPlate and currentPlate ~= nameplate then
@@ -548,10 +559,19 @@ local function HideTurboOverlayFrames(nameplate)
         if ns.HideLiteNameHighlight then
             ns.HideLiteNameHighlight(nameplate.liteContainer)
         end
+        if ns.HideLiteTurboDebuff then
+            ns:HideLiteTurboDebuff(nameplate)
+        end
         nameplate.liteContainer:Hide()
     end
 
     if nameplate.myPlate then
+        if ns.CleanupPlateAuras then
+            ns:CleanupPlateAuras(nameplate.myPlate)
+        end
+        if ns.HideTurboDebuff then
+            ns:HideTurboDebuff(nameplate.myPlate)
+        end
         nameplate.myPlate:Hide()
     end
 end
@@ -571,10 +591,12 @@ local function InstallNativeNameplateLifecycleHooks(nameplate)
     nameplate:HookScript("OnShow", function(frame)
         if not OnNamePlateAdded then return end
 
-        local unit = GetVisibleUnitForNameplate(frame)
-        if unit then
-            OnNamePlateAdded(nil, unit, frame)
-        end
+        NextFrame(function()
+            local unit = GetVisibleUnitForNameplate(frame)
+            if unit and IsNativeNameplateVisible(frame) then
+                OnNamePlateAdded(nil, unit, frame)
+            end
+        end)
     end)
 
     nameplate._turboLifecycleHooksInstalled = true
@@ -586,6 +608,10 @@ local function TrackNameplate(unit, nameplate)
     InstallNativeNameplateLifecycleHooks(nameplate)
 
     local oldUnit = nameplate._turboTrackedUnit
+    local oldGUID = nameplate._turboTrackedGUID
+    local guid = UnitGUID(unit)
+    local guidChanged = oldGUID and guid and oldGUID ~= guid
+
     if oldUnit and oldUnit ~= unit then
         ClearTrackedNameplate(oldUnit, nameplate)
         if ns.unitToPlate[oldUnit] == nameplate.myPlate then
@@ -593,7 +619,10 @@ local function TrackNameplate(unit, nameplate)
         end
     end
 
-    local guid = UnitGUID(unit)
+    if (oldUnit and oldUnit ~= unit) or guidChanged then
+        ClearNameplateUnitCaches(nameplate)
+    end
+
     nameplate._unit = unit
     nameplate._turboTrackedUnit = unit
     nameplate._turboTrackedGUID = guid
@@ -627,8 +656,10 @@ RunGuardedNameplateCleanup = function()
                 else
                     local currentGUID = UnitGUID(unit)
                     if expectedGUID and currentGUID and currentGUID ~= expectedGUID then
-                        ns.unitToNameplateGUID[unit] = currentGUID
-                        nameplate._turboTrackedGUID = currentGUID
+                        OnNamePlateRemoved(nil, unit, nameplate)
+                        if UnitExists(unit) and IsNativeNameplateVisible(nameplate) then
+                            OnNamePlateAdded(nil, unit, nameplate)
+                        end
                     end
                 end
             elseif not currentUnit then
@@ -1312,11 +1343,7 @@ OnNamePlateRemoved = function(_, unit, nameplate)
     end
     if nameplate then
         -- Clear cached unit data (so next unit gets fresh data)
-        nameplate._cachedName = nil
-        nameplate._cachedIsPlayer = nil
-        nameplate._cachedClass = nil
-        nameplate._cachedGuild = nil
-        nameplate._cachedNPCID = nil
+        ClearNameplateUnitCaches(nameplate)
 
         if nameplate.liteContainer then
             ns.HideLiteNameHighlight(nameplate.liteContainer)

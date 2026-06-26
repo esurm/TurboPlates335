@@ -742,6 +742,7 @@ ns.defaults = {
     liteHealthWhenDamaged = true,  -- Show compact HP bar when damaged
     friendlyGuild = false,
     npcTitleCache = {},  -- [npcID] = title (cached via tooltip scan)
+    npcTitleCacheVersion = 2,
     classColoredHealth = true,  -- Use class colors for player health bars (friendly and hostile)
     classColoredName = false,   -- Use custom hostile name color (not class colored)
     arenaNumbers = false,       -- Replace enemy names with arena numbers in arena
@@ -963,6 +964,8 @@ function ns:LoadVariables()
         ns:ApplyActiveLocale()
     end
 
+    local previousNPCTitleCacheVersion = TurboPlatesDB.npcTitleCacheVersion
+
     for k, v in pairs(ns.defaults) do
         if TurboPlatesDB[k] == nil then
             TurboPlatesDB[k] = DeepCopy(v)
@@ -973,6 +976,11 @@ function ns:LoadVariables()
                 end
             end
         end
+    end
+
+    if previousNPCTitleCacheVersion ~= ns.defaults.npcTitleCacheVersion then
+        TurboPlatesDB.npcTitleCache = {}
+        TurboPlatesDB.npcTitleCacheVersion = ns.defaults.npcTitleCacheVersion
     end
 
     -- Migrate the previous temporary default now that the base name position is corrected.
